@@ -1,9 +1,2 @@
-/.DS_Store
-/._.DS_Store
-/._go.mod
-/._go.sum
-/._main.go
-/._static
-/backup
+/.*
 /main
-/vp8
