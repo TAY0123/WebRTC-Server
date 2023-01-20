@@ -11,193 +11,160 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/dgraph-io/badger/v3"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media/samplebuilder"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
 )
 
-var videoTrack map[string]*webrtc.TrackLocalStaticSample
+// /This server allow duplicate name for different device
+// /unless device under same name connect to the server at the same time
 
-// This example shows how to
-// 1. create a RTSP server which accepts plain connections
-// 2. allow a single client to publish a stream with TCP or UDP
-// 3. allow multiple clients to read that stream with TCP, UDP or UDP-multicast
+var (
+	videoTrack map[string]*webrtc.TrackLocalStaticSample
+	upgrader   = websocket.Upgrader{} // use default options
+	logger     = zap.SugaredLogger{}
+)
 
-/*
-type serverHandler struct {
-	mutex  sync.Mutex
-	stream map[*gortsplib.ServerSession]struct {
-		stream *gortsplib.ServerStream
-		path   string
-	}
-	//publisher *gortsplib.ServerSession
+type CameraConnection struct {
+	Name string `JSON:"name"`
+	Uuid string `JSON:"uuid"`
 }
 
-// called when a connection is opened.
-func (sh *serverHandler) OnConnOpen(ctx *gortsplib.ServerHandlerOnConnOpenCtx) {
-	log.Printf("conn opened")
+type ConnectionReply struct {
+	Status bool   `JSON:"status"` //true if connection ok
+	Error  string `JSON:"error"`  //description of error if failed
+	Uuid   string `JSON: "uuid"`  //uuid for matching device
 }
 
-// called when a connection is closed.
-func (sh *serverHandler) OnConnClose(ctx *gortsplib.ServerHandlerOnConnCloseCtx) {
-	log.Printf("conn closed (%v)", ctx.Error)
-}
-
-// called when a session is opened.
-func (sh *serverHandler) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpenCtx) {
-	log.Printf("session opened")
-}
-
-// called when a session is closed.
-func (sh *serverHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
-	log.Printf("session closed")
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
-
-
-		// if the session is the publisher,
-		// close the stream and disconnect any reader.
-		if sh.stream[ctx.pa] != nil && ctx.Session == sh.publisher {
-			sh.stream.Close()
-			sh.stream = nil
-		}
-
-	if val, ok := sh.stream[ctx.Session]; ok {
-		val.stream.Close()
-		delete(sh.stream, ctx.Session)
-	}
-
-}
-
-/*
-// called after receiving a DESCRIBE request.
-func (sh *serverHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("describe request")
-
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
-
-	// no one is publishing yet
-	if sh.stream == nil {
-		return &base.Response{
-			StatusCode: base.StatusNotFound,
-		}, nil, nil
-	}
-
-	// send the track list that is being published to the client
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, sh.stream, nil
-}
-
-
-// called after receiving an ANNOUNCE request.
-func (sh *serverHandler) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	log.Printf("announce request")
-
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
-
-		if sh.stream != nil {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, fmt.Errorf("someone is already publishing")
-		}
-
-		// save the track list and the publisher
-		sh.publisher = ctx.Session
-
-	sh.stream[ctx.Session] = struct {
-		stream *gortsplib.ServerStream
-		path   string
-	}{
-		stream: gortsplib.NewServerStream(ctx.Tracks),
-		path:   ctx.Path,
-	}
-
-	webrtc, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
+func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB) {
+	logger.Info("websocket connection receive from :", r.RemoteAddr)
+	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		return &base.Response{
-			StatusCode: base.StatusBadRequest,
-		}, fmt.Errorf("allocate webrtc stream failed")
+		logger.Error("upgrade:", err)
+		return
 	}
-	videoTrack[ctx.Path] = webrtc
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
+	defer c.Close()
+	for {
+		deviceData := CameraConnection{}
+		err := c.ReadJSON(&deviceData)
+		if err != nil {
+			logger.Error("read:", err)
+			c.WriteJSON(ConnectionReply{
+				Status: false,
+			})
+			continue
+		}
 
+		deviceUUid := deviceData.Uuid
+		deviceName := deviceData.Name
+
+		txn := db.NewTransaction(true)
+
+		if deviceName == "" && deviceUUid != "" { //if the device connected before
+			storedName, err := txn.Get([]byte(deviceUUid))
+			if err != nil {
+				c.WriteJSON(ConnectionReply{
+					Status: false,
+					Error:  "DB read error",
+				})
+				continue
+			}
+			deviceName = storedName.String()
+			logger.Info("Device Connected: ", deviceName)
+
+		}
+
+		//search for duplicate on current session
+		duplicate := false
+		for k, _ := range videoTrack {
+			if k == deviceName {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			logger.Error("Device name conflicted :", deviceName)
+			err = c.WriteJSON(ConnectionReply{ //device with same name exist on the server
+				Status: false,
+				Error:  "Another device with same name already connected at the moment",
+			})
+			continue
+		}
+
+		if deviceUUid == "" { //if it is first time the device connect or uuid not found and no duplicate of name
+			deviceUUid = uuid.NewString()
+			err := txn.Set([]byte(deviceUUid), []byte(deviceName))
+			if err != nil {
+				logger.Error("Error write to DB: ", err)
+				err = c.WriteJSON(ConnectionReply{ //device with same name exist on the server
+					Status: false,
+					Error:  "Error write to DB",
+				})
+				continue
+			}
+		}
+
+		err = c.WriteJSON(ConnectionReply{ //success register device
+			Status: true,
+			Uuid:   deviceUUid,
+		})
+		if err != nil {
+			log.Println("write:", err)
+			break
+		}
+	}
 }
-
-
-// called after receiving a SETUP request.
-func (sh *serverHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("setup request")
-	log.Print(ctx.Path)
-
-
-		// no one is publishing yet
-		return &base.Response{
-			StatusCode: base.StatusNotFound,
-		}, nil, nil
-
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, sh.stream[ctx.Session].stream, nil
-
-}
-
-// called after receiving a PLAY request.
-func (sh *serverHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	log.Printf("play request")
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
-}
-
-// called after receiving a RECORD request.
-func (sh *serverHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	log.Printf("record request")
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
-}
-
-// called after receiving a RTP packet.
-func (sh *serverHandler) OnPacketRTP(ctx *gortsplib.ServerHandlerOnPacketRTPCtx) {
-
-	videoTrack[sh.stream[ctx.Session].path].WriteRTP(ctx.Packet)
-}
-*/
-
-// Create a video track
 
 func main() {
-	//init
+	//init logger
+	alogger, _ := zap.NewProduction()
+	logger = *alogger.Sugar()
+	defer logger.Sync() // flushes buffer, if any
+
+	///define configuration name and load from it
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+
+	///define default value for config file
+	viper.SetDefault("HttpPort", "8543")
+
+	///read config from file
+	err := viper.ReadInConfig() // Find and read the config file
+	if err != nil {             // Handle errors reading the config file
+		log.Panic(fmt.Errorf("fatal error config file: %w", err))
+		logger.Warn("create new confg file: ./config.yaml")
+		viper.WriteConfig()
+	}
+
+	//open KV database
+	db, err := badger.Open(badger.DefaultOptions("./badger"))
+
+	httpServePort := viper.GetString("HttpPort")
+
+	//init variable
 	videoTrack = map[string]*webrtc.TrackLocalStaticSample{}
 
 	//first open a http server
-
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 
 	// Open a UDP Listener for RTP Packets on port 5004
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5004})
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err = listener.Close(); err != nil {
-			panic(err)
-		}
-	}()
 	/*
-		_, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "a")
-		if err != nil {
-			panic(err)
-		}
+			listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5004})
+			if err != nil {
+				panic(err)
+			}
+
+		defer func() {
+			if err = listener.Close(); err != nil {
+				panic(err)
+			}
+		}()
 	*/
 
 	http.HandleFunc("/wrtc", func(rw http.ResponseWriter, req *http.Request) {
@@ -221,18 +188,19 @@ func main() {
 		peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
 			ICEServers: []webrtc.ICEServer{
 				{
-					URLs: []string{"stun:stun.l.google.com:19302"},
+					URLs: stunList,
 				},
 			},
 		})
 		if err != nil {
 			panic(err)
 		}
-
-		rtpSender, err := peerConnection.AddTrack(videoTrack[p])
-		if err != nil {
-			panic(err)
-		}
+		/*
+			rtpSender, err := peerConnection.AddTrack(videoTrack[p])
+			if err != nil {
+				panic(err)
+			}
+		*/
 
 		// Read incoming RTCP packets
 		// Before these packets are returned they are processed by interceptors. For things
@@ -290,7 +258,10 @@ func main() {
 		rw.Write(b)
 		log.Print("client added")
 	})
-	go func() { http.ListenAndServe(":8543", nil) }()
+	go func() {
+		logger.Info("HTTP server started on: ", httpServePort)
+		http.ListenAndServe(":"+string(httpServePort), nil)
+	}()
 
 	/*
 		s := &gortsplib.Server{
