@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+
+  <body>
+    <script>
+      /* eslint-env browser */
+
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: "stun:stun.l.google.com:19302",
+          },
+        ],
+      });
+      const log = (msg) => {
+        document.getElementById("div").innerHTML += msg + "<br>";
+      };
+
+      pc.ontrack = function (event) {
+        const el = document.createElement(event.track.kind);
+        el.srcObject = event.streams[0];
+        el.autoplay = true;
+        el.controls = true;
+
+        document.getElementById("remoteVideos").appendChild(el);
+      };
+
+      pc.oniceconnectionstatechange = (e) => log(pc.iceConnectionState);
+      pc.onicecandidate = (event) => {
+        if (event.candidate === null) {
+          document.getElementById("localSessionDescription").value = btoa(
+            JSON.stringify(pc.localDescription)
+          );
+        }
+      };
+
+      function sendto() {
+        let url = "/wrtc?device=";
+        url += document.getElementsByName("device")[0].value;
+        let xhr = new XMLHttpRequest();
+        xhr.open("POST", url);
+
+        xhr.setRequestHeader("Accept", "application/json");
+        xhr.setRequestHeader("Content-Type", "application/json");
+
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState === 4) {
+            console.log(xhr.responseText);
+            try {
+              pc.setRemoteDescription(
+                new RTCSessionDescription(JSON.parse(xhr.responseText))
+              );
+            } catch (e) {
+              console.error(e);
+            }
+          }
+        };
+
+        let data = JSON.stringify(pc.localDescription);
+
+        console.log(data);
+        xhr.send(data);
+      }
+      // Offer to receive 1 audio, and 1 video track
+      pc.addTransceiver("video", {
+        direction: "sendrecv",
+      });
+      pc.addTransceiver("audio", {
+        direction: "sendrecv",
+      });
+
+      pc.createOffer()
+        .then((d) => pc.setLocalDescription(d))
+        .catch(log);
+
+      window.startSession = () => {
+        const sd = document.getElementById("remoteSessionDescription").value;
+        if (sd === "") {
+          return alert("Session Description must not be empty");
+        }
+
+        try {
+          pc.setRemoteDescription(
+            new RTCSessionDescription(JSON.parse(atob(sd)))
+          );
+        } catch (e) {
+          alert(e);
+        }
+      };
+
+      window.copySDP = () => {
+        const browserSDP = document.getElementById("localSessionDescription");
+
+        browserSDP.focus();
+        browserSDP.select();
+
+        try {
+          const successful = document.execCommand("copy");
+          const msg = successful ? "successful" : "unsuccessful";
+          log("Copying SDP was " + msg);
+        } catch (err) {
+          log("Oops, unable to copy SDP " + err);
+        }
+      };
+    </script>
+    Browser SDP <br />
+    <textarea id="localSessionDescription" readonly="true"></textarea>
+    <br />
+    <button onclick="window.copySDP()">Copy browser SDP to clipboard</button>
+    <button
+      onclick="
+sendto()
+"
+    >
+      connect
+    </button>
+    <br />
+    <br />
+    <br />
+
+    <input type="text" name="device" id="" />
+
+    Video<br />
+    <div id="remoteVideos"></div>
+    <br />
+
+    Logs<br />
+    <div id="div"></div>
+  </body>
+</html>

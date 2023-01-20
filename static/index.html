@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+
+  <body>
+    <script>
+      /* eslint-env browser */
+
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: "stun:stun.l.google.com:19302",
+          },
+        ],
+      });
+
+      pc.ontrack = function (event) {
+        const el = document.getElementById("rtc");
+        el.srcObject = event.streams[0];
+        el.autoplay = true;
+        el.controls = true;
+      };
+
+      pc.oniceconnectionstatechange = (e) => console.log(pc.iceConnectionState);
+
+      function sendto() {
+        let url = "/wrtc?device=";
+        url += document.getElementsByName("device")[0].value;
+        let xhr = new XMLHttpRequest();
+        xhr.open("POST", url);
+
+        xhr.setRequestHeader("Accept", "application/json");
+        xhr.setRequestHeader("Content-Type", "application/json");
+
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState === 4) {
+            console.log(xhr.responseText);
+            try {
+              pc.setRemoteDescription(
+                new RTCSessionDescription(JSON.parse(xhr.responseText))
+              );
+            } catch (e) {
+              console.error(e);
+            }
+          }
+        };
+
+        let data = JSON.stringify(pc.localDescription);
+
+        console.log(data);
+        xhr.send(data);
+      }
+      // Offer to receive 1 audio, and 1 video track
+      pc.addTransceiver("video", {
+        direction: "sendrecv",
+      });
+      pc.addTransceiver("audio", {
+        direction: "sendrecv",
+      });
+
+      pc.createOffer().then((d) => pc.setLocalDescription(d));
+    </script>
+    <button
+      onclick="
+sendto()
+"
+    >
+      connect
+    </button>
+    <br />
+    <br />
+    <br />
+
+    <input type="text" name="device" id="" />
+
+    Video<br />
+    <video id="rtc" muted playsinline autoplay></video>
+    <br />
+  </body>
+</html>
