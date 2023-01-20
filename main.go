@@ -8,16 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media/samplebuilder"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
@@ -26,10 +25,16 @@ import (
 // /unless device under same name connect to the server at the same time
 
 var (
-	videoTrack map[string]*webrtc.TrackLocalStaticSample
-	upgrader   = websocket.Upgrader{} // use default options
-	logger     = zap.SugaredLogger{}
+	upgrader = websocket.Upgrader{} // use default options
+	logger   = zap.SugaredLogger{}
 )
+
+type Device struct {
+	Websocket *websocket.Conn
+	Track     *webrtc.TrackLocalStaticRTP
+	Listener  *net.UDPConn
+	Peer      int
+}
 
 type CameraConnection struct {
 	Name string `JSON:"name"`
@@ -39,12 +44,18 @@ type CameraConnection struct {
 type ConnectionReply struct {
 	Status bool   `JSON:"status"` //true if connection ok
 	Error  string `JSON:"error"`  //description of error if failed
-	Uuid   string `JSON: "uuid"`  //uuid for matching device
+	Uuid   string `JSON:"uuid"`   //uuid for matching device
 }
 
-func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB) {
+type DeviceStreamStatus struct {
+	Stream bool `JSON:"stream"`
+	Port   int  `JSON:"port"`
+}
+
+func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, currentDevices *map[string]Device) {
 	logger.Info("websocket connection receive from :", r.RemoteAddr)
 	c, err := upgrader.Upgrade(w, r, nil)
+
 	if err != nil {
 		logger.Error("upgrade:", err)
 		return
@@ -82,7 +93,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB) {
 
 		//search for duplicate on current session
 		duplicate := false
-		for k, _ := range videoTrack {
+		for k := range *currentDevices {
 			if k == deviceName {
 				duplicate = true
 				break
@@ -110,6 +121,24 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB) {
 			}
 		}
 
+		//device every parm ok
+		//add a ticker to check if connection ok
+		go func(deviceName string) {
+			ticker := time.NewTicker(10 * time.Second)
+			for range ticker.C {
+				if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
+					//if failed to reach client
+					delete(*currentDevices, deviceName)
+					c.Close()
+					return
+				}
+			}
+		}(deviceName)
+
+		(*currentDevices)[deviceName] = Device{
+			Websocket: c,
+		}
+
 		err = c.WriteJSON(ConnectionReply{ //success register device
 			Status: true,
 			Uuid:   deviceUUid,
@@ -118,6 +147,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB) {
 			log.Println("write:", err)
 			break
 		}
+
 	}
 }
 
@@ -142,30 +172,20 @@ func main() {
 		viper.WriteConfig()
 	}
 
+	httpServePort := viper.GetString("HttpPort")
+
 	//open KV database
 	db, err := badger.Open(badger.DefaultOptions("./badger"))
 
-	httpServePort := viper.GetString("HttpPort")
-
 	//init variable
-	videoTrack = map[string]*webrtc.TrackLocalStaticSample{}
+	onlineDevice := map[string]Device{}
 
-	//first open a http server
+	//add http route and handler
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 
-	// Open a UDP Listener for RTP Packets on port 5004
-	/*
-			listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5004})
-			if err != nil {
-				panic(err)
-			}
-
-		defer func() {
-			if err = listener.Close(); err != nil {
-				panic(err)
-			}
-		}()
-	*/
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		webSocketListener(w, r, db, &onlineDevice)
+	})
 
 	http.HandleFunc("/wrtc", func(rw http.ResponseWriter, req *http.Request) {
 		// Wait for the offer to be pasted
@@ -174,7 +194,7 @@ func main() {
 			rw.WriteHeader(http.StatusTeapot)
 			return
 		}
-		if _, ok := videoTrack[p]; !ok {
+		if _, ok := onlineDevice[p]; !ok {
 			rw.WriteHeader(http.StatusTeapot)
 			return
 		}
@@ -182,7 +202,41 @@ func main() {
 		offer := webrtc.SessionDescription{}
 		err = json.Unmarshal(c, &offer)
 		if err != nil {
-			panic(err)
+			logger.Error(err)
+		}
+
+		current := onlineDevice[p]
+		//open port to wait for client stream if current track not exist
+		if current.Track == nil {
+			port := 40000 + rand.Intn(20000) //between 40000 - 60000
+			err = nil
+			for err != nil {
+				current.Listener, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: port})
+				logger.Error("Failed to open Port :", port)
+			}
+			logger.Info("opened port for ", p, " on : ", port)
+
+			//call websocket to ready stream
+			err = current.Websocket.WriteJSON(DeviceStreamStatus{
+				Stream: true,
+				Port:   port,
+			})
+
+			current.Track, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
+
+			go func(current Device) {
+				inboundRTPPacket := make([]byte, 1600) // UDP MTU
+				for {
+					n, _, err := current.Listener.ReadFrom(inboundRTPPacket)
+					if err != nil {
+						logger.Error(current.Websocket.RemoteAddr(), fmt.Sprintf("error during read: %s", err))
+					}
+
+					if _, err = current.Track.Write(inboundRTPPacket[:n]); err != nil {
+						logger.Error(current.Websocket.RemoteAddr(), err)
+					}
+				}
+			}(current)
 		}
 
 		peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
@@ -195,12 +249,10 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		/*
-			rtpSender, err := peerConnection.AddTrack(videoTrack[p])
-			if err != nil {
-				panic(err)
-			}
-		*/
+		rtpSender, err := peerConnection.AddTrack(current.Track)
+		if err != nil {
+			panic(err)
+		}
 
 		// Read incoming RTCP packets
 		// Before these packets are returned they are processed by interceptors. For things
@@ -263,69 +315,8 @@ func main() {
 		http.ListenAndServe(":"+string(httpServePort), nil)
 	}()
 
-	/*
-		s := &gortsplib.Server{
-			Handler: &serverHandler{
-				stream: map[*gortsplib.ServerSession]struct {
-					stream *gortsplib.ServerStream
-					path   string
-				}{},
-			},
-			RTSPAddress: ":8083",
-		}
-	*/
-
 	// start server and wait until a fatal error
 	log.Printf("server is ready")
-	vb := map[string]*samplebuilder.SampleBuilder{}
-	//ml := &sync.WaitGroup{}
-	pc := map[string]chan *rtp.Packet{}
-	for {
-		inboundRTPPacket := make([]byte, 1600) // UDP MTU
-		n, a, err := listener.ReadFromUDP(inboundRTPPacket)
-
-		packet := &rtp.Packet{}
-		if _, ok := videoTrack[a.String()]; !ok { //not exist
-			webrtc, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "pion")
-			if err != nil {
-				continue
-			}
-			vb[a.String()] = samplebuilder.New(10, &codecs.H264Packet{}, 90000)
-			videoTrack[a.String()] = webrtc
-			pc[a.String()] = make(chan *rtp.Packet, 1200)
-			log.Print(a.String())
-			go func(addr string) {
-				for pkt := range pc[addr] {
-					vb[addr].Push(pkt)
-					for {
-						sample := vb[addr].Pop()
-						if sample == nil {
-							break
-						}
-
-						if writeErr := videoTrack[addr].WriteSample(*sample); writeErr != nil {
-							panic(writeErr)
-						}
-					}
-				}
-			}(a.String())
-		}
-
-		if err = packet.Unmarshal(inboundRTPPacket[:n]); err != nil {
-			panic(err)
-		}
-		pc[a.String()] <- packet
-		/*
-			if _, err = videoTrack[a.String()].Write(inboundRTPPacket[:n]); err != nil {
-				if errors.Is(err, io.ErrClosedPipe) {
-					// The peerConnection has been closed.
-					return
-				}
-
-				panic(err)
-			}
-		*/
-	}
-	//panic(s.StartAndWait())
-
+	a := make(chan bool) //keep main thread
+	<-a
 }
