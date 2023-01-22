@@ -100,6 +100,8 @@ func PickRouterClient(ctx context.Context) (RouterClient, error) {
 		return nil, err
 	}
 
+	logrus.Infof("UPnP server discovered: %d", len(ip1Clients)+len(ip2Clients))
+
 	// Trivial handling for where we find exactly one device to talk to, you
 	// might want to provide more flexible handling than this if multiple
 	// devices are found.
@@ -272,45 +274,71 @@ func main() {
 	///define configuration name and load from it
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".") ///define default value for config file
 
-	///define default value for config file
 	viper.SetDefault("HttpPort", "8543")
+	viper.SetDefault("UPnP", true)
+	viper.SetDefault("internalIP", "")
 
 	///read config from file
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
 		logrus.Warn("create new confg file: ./config.yaml")
-		viper.WriteConfig()
+		err = viper.WriteConfigAs("config.yaml")
+		if err != nil {
+			logrus.Error("Write config failed: ", err)
+		}
 	}
+	defer viper.WriteConfig()
 
-	//get router ip and set up upnp
-	client, err := PickRouterClient(context.Background())
-	if err != nil {
-
-	}
-
-	externalIP, err := client.GetExternalIPAddress()
-	if err != nil {
-		logrus.Warn("Cannot get external IP")
-	} else {
-		logrus.Info("external IP: ", externalIP)
-	}
-
-	internalIP, err := LocalIP()
-	if err != nil {
-		logrus.Error("Cannot get internal IP")
-		logrus.Error("This server will only function locally")
-	} else {
-		logrus.Info("internal IP: ", internalIP.String())
-	}
-
+	UPnPEnable := viper.GetBool("UPnP")
 	httpServePort := viper.GetString("HttpPort")
+	configuredIP := viper.GetString("internalIP")
 
 	//open KV database
 	db, err := badger.Open(badger.DefaultOptions("./badger"))
 
 	//init variable
 	onlineDevice := map[string]Device{}
+
+	//get router ip and set up upnp
+	var client RouterClient
+	if UPnPEnable {
+		client, err = PickRouterClient(context.Background())
+		if err != nil {
+			logrus.Error("Upnp service failed to start: ", err)
+		} else {
+			externalIP, err := client.GetExternalIPAddress()
+			if err != nil {
+				logrus.Warn("Cannot get external IP")
+			} else {
+				logrus.Info("external IP: ", externalIP)
+			}
+		}
+	} else {
+		logrus.Info("UPnP diabled")
+	}
+
+	var internalIP net.IP
+	if configuredIP == "" {
+		internalIP, err = LocalIP()
+		if err != nil {
+			logrus.Error("Cannot get internal IP: ", err)
+			logrus.Error("If server enabled UPnP this will disable UPnP function")
+		}
+	} else {
+		internalIP = net.ParseIP(configuredIP)
+		if internalIP == nil {
+			logrus.Error("Parse IP address failed")
+		}
+	}
+
+	if internalIP == nil {
+		logrus.Error("If server enabled UPnP this will disable UPnP function")
+	} else {
+		logrus.Info("internal IP: ", internalIP.String())
+
+	}
 
 	//add http route and handler
 	http.Handle("/", http.FileServer(http.Dir("./static")))
@@ -349,18 +377,20 @@ func main() {
 			logrus.Info("opened port for ", p, " on : ", port)
 
 			//setup upnp port forwarding
-			err = client.AddPortMapping(
-				"",
-				uint16(port),
-				"UDP",
-				uint16(port),
-				string(internalIP),
-				true,
-				"WebRTC Stream for :"+p,
-				3600,
-			)
-			if err != nil {
-				logrus.Warn("failed to open external port " + strconv.Itoa(port) + " for: " + p)
+			if client != nil && internalIP != nil {
+				err = client.AddPortMapping(
+					"",
+					uint16(port),
+					"UDP",
+					uint16(port),
+					string(internalIP),
+					true,
+					"WebRTC Stream for :"+p,
+					3600,
+				)
+				if err != nil {
+					logrus.Warn("failed to open external port " + strconv.Itoa(port) + " for: " + p)
+				}
 			}
 
 			//call websocket to ready stream
