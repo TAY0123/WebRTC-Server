@@ -12,6 +12,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"time"
 
@@ -371,7 +373,9 @@ func main() {
 			err = errors.New("placeholder")
 			for err != nil {
 				current.Listener, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: port})
-				logrus.Error("Failed to open Port :", port)
+				if err != nil {
+					logrus.Error("Failed to open Port :", port)
+				}
 			}
 			logrus.Info("opened port for ", p, " on : ", port)
 
@@ -389,6 +393,7 @@ func main() {
 				)
 				if err != nil {
 					logrus.Warn("failed to open external port " + strconv.Itoa(port) + " for: " + p)
+					logrus.Warn(err)
 				}
 			}
 
@@ -494,6 +499,8 @@ func main() {
 
 	// start server and wait until a fatal error
 	logrus.Info("server is ready")
-	a := make(chan bool) //keep main thread
-	<-a
+	//capture ^c
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	<-c
 }
