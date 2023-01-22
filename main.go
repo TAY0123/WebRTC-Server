@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -263,7 +262,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 			Uuid:   deviceUUid,
 		})
 		if err != nil {
-			log.Println("write:", err)
+			logrus.Error("write:", err)
 			break
 		}
 
@@ -486,7 +485,7 @@ func main() {
 		}
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write(b)
-		log.Print("client added")
+		logrus.Info("client added")
 	})
 	go func() {
 		logrus.Info("HTTP server started on: ", httpServePort)
@@ -494,7 +493,7 @@ func main() {
 	}()
 
 	// start server and wait until a fatal error
-	log.Printf("server is ready")
+	logrus.Info("server is ready")
 	a := make(chan bool) //keep main thread
 	<-a
 }
