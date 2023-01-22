@@ -4,21 +4,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/huin/goupnp/dcps/internetgateway2"
 	"github.com/pion/webrtc/v3"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // /This server allow duplicate name for different device
@@ -26,7 +31,6 @@ import (
 
 var (
 	upgrader = websocket.Upgrader{} // use default options
-	logger   = zap.SugaredLogger{}
 )
 
 type Device struct {
@@ -52,12 +56,125 @@ type DeviceStreamStatus struct {
 	Port   int  `JSON:"port"`
 }
 
+type RouterClient interface {
+	AddPortMapping(
+		NewRemoteHost string,
+		NewExternalPort uint16,
+		NewProtocol string,
+		NewInternalPort uint16,
+		NewInternalClient string,
+		NewEnabled bool,
+		NewPortMappingDescription string,
+		NewLeaseDuration uint32,
+	) (err error)
+
+	GetExternalIPAddress() (
+		NewExternalIPAddress string,
+		err error,
+	)
+}
+
+func PickRouterClient(ctx context.Context) (RouterClient, error) {
+	tasks, _ := errgroup.WithContext(ctx)
+	// Request each type of client in parallel, and return what is found.
+	var ip1Clients []*internetgateway2.WANIPConnection1
+	tasks.Go(func() error {
+		var err error
+		ip1Clients, _, err = internetgateway2.NewWANIPConnection1Clients()
+		return err
+	})
+	var ip2Clients []*internetgateway2.WANIPConnection2
+	tasks.Go(func() error {
+		var err error
+		ip2Clients, _, err = internetgateway2.NewWANIPConnection2Clients()
+		return err
+	})
+	var ppp1Clients []*internetgateway2.WANPPPConnection1
+	tasks.Go(func() error {
+		var err error
+		ppp1Clients, _, err = internetgateway2.NewWANPPPConnection1Clients()
+		return err
+	})
+
+	if err := tasks.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Trivial handling for where we find exactly one device to talk to, you
+	// might want to provide more flexible handling than this if multiple
+	// devices are found.
+	switch {
+	case len(ip2Clients) == 1:
+		return ip2Clients[0], nil
+	case len(ip1Clients) == 1:
+		return ip1Clients[0], nil
+	case len(ppp1Clients) == 1:
+		return ppp1Clients[0], nil
+	default:
+		return nil, errors.New("multiple or no services found")
+	}
+}
+
+// LocalIP get the host machine local IP address
+func LocalIP() (net.IP, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if isPrivateIP(ip) {
+				return ip, nil
+			}
+		}
+	}
+
+	return nil, errors.New("no IP")
+}
+
+func isPrivateIP(ip net.IP) bool {
+	var privateIPBlocks []*net.IPNet
+	for _, cidr := range []string{
+		// don't check loopback ips
+		//"127.0.0.0/8",    // IPv4 loopback
+		//"::1/128",        // IPv6 loopback
+		//"fe80::/10",      // IPv6 link-local
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+	} {
+		_, block, _ := net.ParseCIDR(cidr)
+		privateIPBlocks = append(privateIPBlocks, block)
+	}
+
+	for _, block := range privateIPBlocks {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, currentDevices *map[string]Device) {
-	logger.Info("websocket connection receive from :", r.RemoteAddr)
+	logrus.Info("websocket connection receive from :", r.RemoteAddr)
 	c, err := upgrader.Upgrade(w, r, nil)
 
 	if err != nil {
-		logger.Error("upgrade:", err)
+		logrus.Error("upgrade:", err)
 		return
 	}
 	defer c.Close()
@@ -65,7 +182,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 		deviceData := CameraConnection{}
 		err := c.ReadJSON(&deviceData)
 		if err != nil {
-			logger.Error("read:", err)
+			logrus.Error("read:", err)
 			c.WriteJSON(ConnectionReply{
 				Status: false,
 			})
@@ -87,7 +204,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 				continue
 			}
 			deviceName = storedName.String()
-			logger.Info("Device Connected: ", deviceName)
+			logrus.Info("Device Connected: ", deviceName)
 
 		}
 
@@ -100,7 +217,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 			}
 		}
 		if duplicate {
-			logger.Error("Device name conflicted :", deviceName)
+			logrus.Error("Device name conflicted :", deviceName)
 			err = c.WriteJSON(ConnectionReply{ //device with same name exist on the server
 				Status: false,
 				Error:  "Another device with same name already connected at the moment",
@@ -112,7 +229,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 			deviceUUid = uuid.NewString()
 			err := txn.Set([]byte(deviceUUid), []byte(deviceName))
 			if err != nil {
-				logger.Error("Error write to DB: ", err)
+				logrus.Error("Error write to DB: ", err)
 				err = c.WriteJSON(ConnectionReply{ //device with same name exist on the server
 					Status: false,
 					Error:  "Error write to DB",
@@ -120,7 +237,7 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 				continue
 			}
 		}
-
+		logrus.Info("device ready : ", deviceName)
 		//device every parm ok
 		//add a ticker to check if connection ok
 		go func(deviceName string) {
@@ -152,11 +269,6 @@ func webSocketListener(w http.ResponseWriter, r *http.Request, db *badger.DB, cu
 }
 
 func main() {
-	//init logger
-	alogger, _ := zap.NewProduction()
-	logger = *alogger.Sugar()
-	defer logger.Sync() // flushes buffer, if any
-
 	///define configuration name and load from it
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
@@ -167,9 +279,29 @@ func main() {
 	///read config from file
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
-		log.Panic(fmt.Errorf("fatal error config file: %w", err))
-		logger.Warn("create new confg file: ./config.yaml")
+		logrus.Warn("create new confg file: ./config.yaml")
 		viper.WriteConfig()
+	}
+
+	//get router ip and set up upnp
+	client, err := PickRouterClient(context.Background())
+	if err != nil {
+
+	}
+
+	externalIP, err := client.GetExternalIPAddress()
+	if err != nil {
+		logrus.Warn("Cannot get external IP")
+	} else {
+		logrus.Info("external IP: ", externalIP)
+	}
+
+	internalIP, err := LocalIP()
+	if err != nil {
+		logrus.Error("Cannot get internal IP")
+		logrus.Error("This server will only function locally")
+	} else {
+		logrus.Info("internal IP: ", internalIP.String())
 	}
 
 	httpServePort := viper.GetString("HttpPort")
@@ -202,19 +334,34 @@ func main() {
 		offer := webrtc.SessionDescription{}
 		err = json.Unmarshal(c, &offer)
 		if err != nil {
-			logger.Error(err)
+			logrus.Error(err)
 		}
 
 		current := onlineDevice[p]
 		//open port to wait for client stream if current track not exist
 		if current.Track == nil {
 			port := 40000 + rand.Intn(20000) //between 40000 - 60000
-			err = nil
+			err = errors.New("placeholder")
 			for err != nil {
 				current.Listener, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: port})
-				logger.Error("Failed to open Port :", port)
+				logrus.Error("Failed to open Port :", port)
 			}
-			logger.Info("opened port for ", p, " on : ", port)
+			logrus.Info("opened port for ", p, " on : ", port)
+
+			//setup upnp port forwarding
+			err = client.AddPortMapping(
+				"",
+				uint16(port),
+				"UDP",
+				uint16(port),
+				string(internalIP),
+				true,
+				"WebRTC Stream for :"+p,
+				3600,
+			)
+			if err != nil {
+				logrus.Warn("failed to open external port " + strconv.Itoa(port) + " for: " + p)
+			}
 
 			//call websocket to ready stream
 			err = current.Websocket.WriteJSON(DeviceStreamStatus{
@@ -229,11 +376,12 @@ func main() {
 				for {
 					n, _, err := current.Listener.ReadFrom(inboundRTPPacket)
 					if err != nil {
-						logger.Error(current.Websocket.RemoteAddr(), fmt.Sprintf("error during read: %s", err))
+						logrus.Error(fmt.Sprintf("error during read: %s", err))
+						continue
 					}
 
 					if _, err = current.Track.Write(inboundRTPPacket[:n]); err != nil {
-						logger.Error(current.Websocket.RemoteAddr(), err)
+						logrus.Error(current.Websocket.RemoteAddr(), err)
 					}
 				}
 			}(current)
@@ -311,7 +459,7 @@ func main() {
 		log.Print("client added")
 	})
 	go func() {
-		logger.Info("HTTP server started on: ", httpServePort)
+		logrus.Info("HTTP server started on: ", httpServePort)
 		http.ListenAndServe(":"+string(httpServePort), nil)
 	}()
 
